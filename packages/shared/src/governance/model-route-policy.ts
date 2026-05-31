@@ -214,3 +214,213 @@ export const EDIS_OPENROUTER_MODEL_ROUTE_POLICY = {
     allowedModels: EDIS_OPENROUTER_ALLOWED_MODELS,
   },
 } as const satisfies ModelRoutePolicy;
+
+export interface ModelRouteSignals {
+  normalizedProvider: string | null;
+  normalizedModel: string | null;
+  normalizedBaseUrl: string | null;
+  isProviderAuto: boolean;
+  isOpenRouterRoute: boolean;
+  isOpenRouterRouterModel: boolean;
+  redactedSignals: string[];
+}
+
+export interface ModelRouteApproval {
+  id: string;
+  provider: string;
+  model: string;
+  usageCategory: ModelRouteUsageCategory;
+  scopeKind: ModelRouteScopeKind;
+  scopeId?: string | null;
+  expiresAt: string;
+}
+
+export interface EvaluateModelRoutePolicyOptions {
+  policy?: ModelRoutePolicy;
+  approval?: ModelRouteApproval | null;
+  now?: Date;
+}
+
+const OPENROUTER_HOST_RE = /(^|\.)openrouter\.ai$/i;
+const OPENROUTER_ENV_KEY = "OPENROUTER_API_KEY";
+const REQUIRED_APPROVAL_FIELDS = [
+  "approvalId",
+  "provider",
+  "model",
+  "usageCategory",
+  "scopeKind",
+  "scopeId",
+  "expiresAt",
+];
+
+export function normalizeModelRouteText(value: string | null | undefined): string | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized ? normalized : null;
+}
+
+export function normalizeModelRouteBaseUrl(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    return new URL(trimmed).hostname.toLowerCase();
+  } catch {
+    return normalizeModelRouteText(trimmed);
+  }
+}
+
+export function collectRouteSignals(candidate: ModelRouteCandidate): ModelRouteSignals {
+  const normalizedProvider = normalizeModelRouteText(candidate.provider);
+  const normalizedModel = normalizeModelRouteText(candidate.model);
+  const normalizedBaseUrl = normalizeModelRouteBaseUrl(candidate.baseUrl);
+  const redactedSignals: string[] = [];
+
+  const isProviderAuto = normalizedProvider === "auto" || normalizedProvider === "provider:auto";
+  if (isProviderAuto) {
+    redactedSignals.push("provider:auto");
+  } else if (normalizedProvider === "openrouter") {
+    redactedSignals.push("provider:openrouter");
+  }
+
+  const hasOpenRouterBaseUrl = normalizedBaseUrl ? OPENROUTER_HOST_RE.test(normalizedBaseUrl) : false;
+  if (hasOpenRouterBaseUrl) {
+    redactedSignals.push("baseUrl:openrouter.ai");
+  }
+
+  const hasOpenRouterEnvKey = candidate.envKeysPresent?.some(
+    (key) => key.trim().toUpperCase() === OPENROUTER_ENV_KEY,
+  ) ?? false;
+  if (hasOpenRouterEnvKey) {
+    redactedSignals.push("env:OPENROUTER_API_KEY_PRESENT");
+  }
+
+  const isOpenRouterRoute = normalizedProvider === "openrouter" || hasOpenRouterBaseUrl || hasOpenRouterEnvKey;
+  const isOpenRouterRouterModel = Boolean(
+    normalizedModel &&
+      (normalizedModel === "auto" ||
+        normalizedModel === "provider:auto" ||
+        normalizedModel.includes("/auto") ||
+        normalizedModel.includes("router") ||
+        normalizedModel.includes("provider:auto")),
+  );
+  if (isOpenRouterRoute && isOpenRouterRouterModel && normalizedModel) {
+    redactedSignals.push(`model:${normalizedModel}`);
+  }
+
+  return {
+    normalizedProvider,
+    normalizedModel,
+    normalizedBaseUrl,
+    isProviderAuto,
+    isOpenRouterRoute,
+    isOpenRouterRouterModel,
+    redactedSignals,
+  };
+}
+
+export function evaluateModelRoutePolicy(
+  candidate: ModelRouteCandidate,
+  options: EvaluateModelRoutePolicyOptions = {},
+): ModelRoutePolicyDecision {
+  const policy = options.policy ?? EDIS_OPENROUTER_MODEL_ROUTE_POLICY;
+  const signals = collectRouteSignals(candidate);
+  const normalizedProvider = signals.normalizedProvider ?? policy.defaultProvider;
+  const normalizedModel = signals.normalizedModel ?? null;
+
+  if (signals.isProviderAuto) {
+    return {
+      allowed: false,
+      violationCode: "policy_provider_auto_disallowed",
+      reason: "provider:auto is not allowed for EDIS model routes.",
+      redactedSignals: signals.redactedSignals,
+    };
+  }
+
+  if (!signals.isOpenRouterRoute) {
+    return {
+      allowed: true,
+      normalizedProvider,
+      normalizedModel,
+      approvalId: null,
+      warnings: [],
+    };
+  }
+
+  if (signals.isOpenRouterRouterModel) {
+    return {
+      allowed: false,
+      violationCode: "policy_openrouter_router_disallowed",
+      reason: "OpenRouter router and dynamic selector model routes are disallowed.",
+      redactedSignals: signals.redactedSignals,
+    };
+  }
+
+  const allowedModel = policy.openRouter.allowedModels.find((model) => model.modelId === normalizedModel);
+  if (!allowedModel) {
+    return {
+      allowed: false,
+      violationCode: "policy_model_not_allowlisted",
+      reason: "OpenRouter model is not present in the EDIS allowlist.",
+      redactedSignals: signals.redactedSignals,
+    };
+  }
+
+  const approval = options.approval ?? null;
+  if (!isValidModelRouteApproval(candidate, allowedModel, approval, options.now ?? new Date())) {
+    return {
+      allowed: false,
+      violationCode: "policy_openrouter_approval_required",
+      reason: "OpenRouter routes require recorded approval before use.",
+      requiredApprovalFields: [...REQUIRED_APPROVAL_FIELDS],
+      redactedSignals: signals.redactedSignals,
+    };
+  }
+
+  return {
+    allowed: true,
+    normalizedProvider: "openrouter",
+    normalizedModel,
+    approvalId: approval.id,
+    warnings: [],
+  };
+}
+
+function isValidModelRouteApproval(
+  candidate: ModelRouteCandidate,
+  allowedModel: OpenRouterAllowedModelRoute,
+  approval: ModelRouteApproval | null,
+  now: Date,
+): approval is ModelRouteApproval {
+  if (!approval) {
+    return false;
+  }
+
+  if (normalizeModelRouteText(approval.provider) !== allowedModel.provider) {
+    return false;
+  }
+
+  if (normalizeModelRouteText(approval.model) !== allowedModel.modelId) {
+    return false;
+  }
+
+  if (candidate.usageCategory && approval.usageCategory !== candidate.usageCategory) {
+    return false;
+  }
+
+  if (!allowedModel.usageCategories.includes(approval.usageCategory)) {
+    return false;
+  }
+
+  if (approval.scopeKind !== candidate.scopeKind) {
+    return false;
+  }
+
+  if ((approval.scopeId ?? null) !== (candidate.scopeId ?? null)) {
+    return false;
+  }
+
+  const expiresAt = Date.parse(approval.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt > now.getTime();
+}
