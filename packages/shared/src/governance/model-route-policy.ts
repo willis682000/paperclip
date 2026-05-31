@@ -387,6 +387,37 @@ export function evaluateModelRoutePolicy(
   };
 }
 
+export interface ModelRouteReportOnlyFinding {
+  mode: "report_only";
+  severity: "warning";
+  path: string;
+  message: string;
+  candidate: ModelRouteCandidate;
+  decision: Extract<ModelRoutePolicyDecision, { allowed: false }>;
+}
+
+export interface AuditModelRouteCandidateReportOnlyInput {
+  candidate: ModelRouteCandidate;
+  path?: string | null;
+  options?: EvaluateModelRoutePolicyOptions;
+}
+
+export function auditModelRouteCandidateReportOnly(
+  input: AuditModelRouteCandidateReportOnlyInput,
+): ModelRouteReportOnlyFinding | null {
+  const decision = evaluateModelRoutePolicy(input.candidate, input.options);
+  if (decision.allowed) return null;
+
+  return {
+    mode: "report_only",
+    severity: "warning",
+    path: input.path ?? input.candidate.adapterConfigPath ?? "modelRoute",
+    message: "Model route policy violation detected in report-only mode; runtime behavior was not blocked.",
+    candidate: input.candidate,
+    decision,
+  };
+}
+
 function isValidModelRouteApproval(
   candidate: ModelRouteCandidate,
   allowedModel: OpenRouterAllowedModelRoute,

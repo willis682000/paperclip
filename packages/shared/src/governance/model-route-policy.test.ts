@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  auditModelRouteCandidateReportOnly,
   collectRouteSignals,
   EDIS_OPENROUTER_MODEL_ROUTE_POLICY,
   evaluateModelRoutePolicy,
@@ -187,6 +188,55 @@ describe("EDIS OpenRouter model route policy", () => {
     if (!decision.allowed) {
       expect(decision.violationCode).toBe("policy_model_not_allowlisted");
     }
+  });
+
+  it("returns report-only audit warnings without blocking OpenRouter violations", () => {
+    const finding = auditModelRouteCandidateReportOnly({
+      candidate: {
+        companyId: "company-1",
+        actorKind: "agent",
+        actorId: "agent-1",
+        scopeKind: "agent",
+        scopeId: "agent-1",
+        adapterType: "codex_local",
+        adapterConfigPath: "adapterConfig",
+        provider: "openrouter",
+        model: "anthropic/claude-sonnet-4.5",
+        usageCategory: "primary",
+      },
+      path: "adapterConfig",
+    });
+
+    expect(finding).toMatchObject({
+      mode: "report_only",
+      severity: "warning",
+      path: "adapterConfig",
+      message: "Model route policy violation detected in report-only mode; runtime behavior was not blocked.",
+    });
+    expect(finding?.decision.allowed).toBe(false);
+    if (finding && !finding.decision.allowed) {
+      expect(finding.decision.violationCode).toBe("policy_model_not_allowlisted");
+    }
+  });
+
+  it("does not return report-only audit findings for approved primary routes", () => {
+    const finding = auditModelRouteCandidateReportOnly({
+      candidate: {
+        companyId: "company-1",
+        actorKind: "agent",
+        actorId: "agent-1",
+        scopeKind: "agent",
+        scopeId: "agent-1",
+        adapterType: "codex_local",
+        adapterConfigPath: "adapterConfig",
+        provider: "openai-codex",
+        model: "gpt-5.5",
+        usageCategory: "primary",
+      },
+      path: "adapterConfig",
+    });
+
+    expect(finding).toBeNull();
   });
 
   it("requires valid approval data for exact allowlisted OpenRouter model IDs", () => {

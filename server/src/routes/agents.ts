@@ -8,6 +8,8 @@ import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  auditModelRouteCandidateReportOnly,
+  type ModelRouteReportOnlyFinding,
   createAgentKeySchema,
   createAgentHireSchema,
   createAgentSchema,
@@ -809,6 +811,58 @@ export function agentRoutes(
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : null;
+  }
+
+  function readFirstNonEmptyString(record: Record<string, unknown>, keys: string[]): string | null {
+    for (const key of keys) {
+      const value = asNonEmptyString(record[key]);
+      if (value) return value;
+    }
+    return null;
+  }
+
+  function collectEnvKeysPresent(adapterConfig: Record<string, unknown>): string[] {
+    const env = asRecord(adapterConfig.env);
+    return env ? Object.keys(env) : [];
+  }
+
+  function auditAgentModelRoutesReportOnly(input: {
+    companyId: string;
+    actorKind: "agent" | "user" | "system";
+    actorId?: string | null;
+    scopeId?: string | null;
+    adapterType: string;
+    adapterConfig: Record<string, unknown>;
+    runtimeConfig?: Record<string, unknown> | null;
+  }): { mode: "report_only"; findings: ModelRouteReportOnlyFinding[] } | null {
+    const findings: ModelRouteReportOnlyFinding[] = [];
+    const auditConfig = (adapterConfig: Record<string, unknown>, path: string, usageCategory: "primary" | "cheap_docs" | "unknown") => {
+      const finding = auditModelRouteCandidateReportOnly({
+        path,
+        candidate: {
+          companyId: input.companyId,
+          actorKind: input.actorKind,
+          actorId: input.actorId,
+          scopeKind: "agent",
+          scopeId: input.scopeId,
+          adapterType: input.adapterType,
+          adapterConfigPath: path,
+          provider: readFirstNonEmptyString(adapterConfig, ["provider", "providerId", "modelProvider"]),
+          model: readFirstNonEmptyString(adapterConfig, ["model", "modelId", "modelName"]),
+          baseUrl: readFirstNonEmptyString(adapterConfig, ["baseUrl", "baseURL", "apiBaseUrl", "openAIBaseUrl"]),
+          envKeysPresent: collectEnvKeysPresent(adapterConfig),
+          usageCategory,
+        },
+      });
+      if (finding) findings.push(finding);
+    };
+
+    auditConfig(input.adapterConfig, "adapterConfig", "primary");
+    for (const entry of listRuntimeModelProfileAdapterConfigs(input.runtimeConfig)) {
+      auditConfig(entry.adapterConfig, entry.path, entry.profileKey === "cheap" ? "cheap_docs" : "unknown");
+    }
+
+    return findings.length > 0 ? { mode: "report_only", findings } : null;
   }
 
   function preserveInstructionsBundleConfig(
@@ -2198,6 +2252,15 @@ export function agentRoutes(
     }
 
     const actor = getActorInfo(req);
+    const modelRouteAudit = auditAgentModelRoutesReportOnly({
+      companyId,
+      actorKind: actor.actorType,
+      actorId: actor.actorId,
+      scopeId: agent.id,
+      adapterType: agent.adapterType,
+      adapterConfig: asRecord(agent.adapterConfig) ?? {},
+      runtimeConfig: asRecord(agent.runtimeConfig),
+    });
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
@@ -2211,6 +2274,7 @@ export function agentRoutes(
         name: agent.name,
         role: agent.role,
         desiredSkills: desiredSkillAssignment.desiredSkills,
+        ...(modelRouteAudit ? { modelRouteAudit } : {}),
       },
     });
     const telemetryClient = getTelemetryClient();
@@ -2681,6 +2745,15 @@ export function agentRoutes(
       );
     }
 
+    const modelRouteAudit = auditAgentModelRoutesReportOnly({
+      companyId: agent.companyId,
+      actorKind: actor.actorType,
+      actorId: actor.actorId,
+      scopeId: agent.id,
+      adapterType: requestedAdapterType,
+      adapterConfig: asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {},
+      runtimeConfig: asRecord(patchData.runtimeConfig) ?? asRecord(existing.runtimeConfig),
+    });
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
@@ -2690,7 +2763,10 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: {
+        ...summarizeAgentUpdateDetails(patchData),
+        ...(modelRouteAudit ? { modelRouteAudit } : {}),
+      },
     });
 
     res.json(agent);

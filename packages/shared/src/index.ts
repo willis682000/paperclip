@@ -1,5 +1,6 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  auditModelRouteCandidateReportOnly,
   collectRouteSignals,
   EDIS_OPENROUTER_ALLOWED_MODELS,
   EDIS_OPENROUTER_BLOCKED_PATTERNS,
@@ -7,12 +8,14 @@ export {
   evaluateModelRoutePolicy,
   normalizeModelRouteBaseUrl,
   normalizeModelRouteText,
+  type AuditModelRouteCandidateReportOnlyInput,
   type EvaluateModelRoutePolicyOptions,
   type ModelRouteActorKind,
   type ModelRouteApproval,
   type ModelRouteCandidate,
   type ModelRoutePolicy,
   type ModelRoutePolicyDecision,
+  type ModelRouteReportOnlyFinding,
   type ModelRouteScopeKind,
   type ModelRouteSignals,
   type ModelRouteUsageCategory,

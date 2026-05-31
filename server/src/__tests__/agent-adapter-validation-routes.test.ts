@@ -6,6 +6,7 @@ import type { ServerAdapterModule } from "../adapters/index.js";
 const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
+  update: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -24,6 +25,7 @@ const mockCompanySkillService = vi.hoisted(() => ({
 const mockSecretService = vi.hoisted(() => ({
   normalizeAdapterConfigForPersistence: vi.fn(async (_companyId: string, config: Record<string, unknown>) => config),
   resolveAdapterConfigForRuntime: vi.fn(async (_companyId: string, config: Record<string, unknown>) => ({ config })),
+  syncEnvBindingsForTarget: vi.fn(async () => undefined),
 }));
 
 const mockAgentInstructionsService = vi.hoisted(() => ({
@@ -80,6 +82,10 @@ vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => mockInstanceSettingsService,
 }));
 
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => mockSecretService,
+}));
+
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
@@ -99,6 +105,10 @@ function registerModuleMocks() {
 
   vi.doMock("../services/instance-settings.js", () => ({
     instanceSettingsService: () => mockInstanceSettingsService,
+  }));
+
+  vi.doMock("../services/secrets.js", () => ({
+    secretService: () => mockSecretService,
   }));
 }
 
@@ -202,9 +212,9 @@ describe("agent routes adapter validation", () => {
     mockAccessService.ensureMembership.mockResolvedValue(undefined);
     mockAccessService.setPrincipalPermission.mockResolvedValue(undefined);
     mockLogActivity.mockResolvedValue(undefined);
-    mockAgentService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
-      id: "11111111-1111-4111-8111-111111111111",
-      companyId: "company-1",
+    const makeAgent = (input: Record<string, unknown> = {}) => ({
+      id: String(input.id ?? "11111111-1111-4111-8111-111111111111"),
+      companyId: String(input.companyId ?? "company-1"),
       name: String(input.name ?? "Agent"),
       urlKey: "agent",
       role: String(input.role ?? "general"),
@@ -225,6 +235,12 @@ describe("agent routes adapter validation", () => {
       metadata: null,
       createdAt: new Date(),
       updatedAt: new Date(),
+      defaultEnvironmentId: null,
+    });
+    mockAgentService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => makeAgent(input));
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => makeAgent({
+      id: _id,
+      ...patch,
     }));
     await unregisterTestAdapter("external_test");
     await unregisterTestAdapter(missingAdapterType);
@@ -251,6 +267,115 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.adapterType).toBe("external_test");
+  });
+
+  it("records report-only model route audit warnings without blocking agent creation", async () => {
+    const { registerServerAdapter } = await import("../adapters/index.js");
+    registerServerAdapter(externalAdapter);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({
+          name: "Audited Agent",
+          adapterType: "external_test",
+          adapterConfig: {
+            provider: "openrouter",
+            model: "anthropic/claude-sonnet-4.5",
+          },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.adapterType).toBe("external_test");
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.created",
+        details: expect.objectContaining({
+          modelRouteAudit: expect.objectContaining({
+            mode: "report_only",
+            findings: [
+              expect.objectContaining({
+                path: "adapterConfig",
+                severity: "warning",
+                decision: expect.objectContaining({
+                  allowed: false,
+                  violationCode: "policy_model_not_allowlisted",
+                }),
+              }),
+            ],
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("records report-only model route audit warnings without blocking agent updates", async () => {
+    const { registerServerAdapter } = await import("../adapters/index.js");
+    registerServerAdapter(externalAdapter);
+    mockAgentService.getById.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      adapterType: "external_test",
+      adapterConfig: {},
+      runtimeConfig: {},
+      defaultEnvironmentId: null,
+    });
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({
+          adapterConfig: {
+            provider: "openrouter",
+            model: "anthropic/claude-sonnet-4.5",
+          },
+          runtimeConfig: {
+            modelProfiles: {
+              cheap: {
+                adapterConfig: {
+                  provider: "openrouter",
+                  model: "google/gemini-2.5-flash-lite",
+                },
+              },
+            },
+          },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.updated",
+        details: expect.objectContaining({
+          modelRouteAudit: expect.objectContaining({
+            mode: "report_only",
+            findings: expect.arrayContaining([
+              expect.objectContaining({
+                path: "adapterConfig",
+                severity: "warning",
+                decision: expect.objectContaining({
+                  allowed: false,
+                  violationCode: "policy_model_not_allowlisted",
+                }),
+              }),
+              expect.objectContaining({
+                path: "runtimeConfig.modelProfiles.cheap.adapterConfig",
+                severity: "warning",
+                decision: expect.objectContaining({
+                  allowed: false,
+                  violationCode: "policy_openrouter_approval_required",
+                }),
+              }),
+            ]),
+          }),
+        }),
+      }),
+    );
   });
 
   it("rejects unknown adapter types even when schema accepts arbitrary strings", async () => {

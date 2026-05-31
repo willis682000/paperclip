@@ -15,6 +15,10 @@ const mockIssueService = vi.hoisted(() => ({
   getWakeableParentAfterChildCompletion: vi.fn(),
 }));
 
+const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
+}));
+
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(async () => false),
@@ -79,9 +83,7 @@ function registerModuleMocks() {
       getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
     }),
     accessService: () => mockAccessService,
-    agentService: () => ({
-      getById: vi.fn(async () => null),
-    }),
+    agentService: () => mockAgentService,
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
@@ -178,6 +180,7 @@ describe("issue activity event routes", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockAgentService.getById.mockResolvedValue(null);
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
@@ -200,6 +203,56 @@ describe("issue activity event routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
+  });
+
+  it("records report-only model route audit warnings for issue assignee adapter overrides without blocking updates", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({
+        assigneeAdapterOverrides: {
+          adapterConfig: {
+            provider: "openrouter",
+            model: "anthropic/claude-sonnet-4.5",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({
+          assigneeAdapterOverrides: {
+            adapterConfig: {
+              provider: "openrouter",
+              model: "anthropic/claude-sonnet-4.5",
+            },
+          },
+          modelRouteAudit: expect.objectContaining({
+            mode: "report_only",
+            findings: [
+              expect.objectContaining({
+                path: "assigneeAdapterOverrides.adapterConfig",
+                severity: "warning",
+                decision: expect.objectContaining({
+                  allowed: false,
+                  violationCode: "policy_model_not_allowlisted",
+                }),
+              }),
+            ],
+          }),
+        }),
+      }),
+    );
   });
 
   it("logs blocker activity with added and removed issue summaries", async () => {

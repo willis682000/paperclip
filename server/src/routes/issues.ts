@@ -16,6 +16,8 @@ import {
 import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
+  auditModelRouteCandidateReportOnly,
+  type ModelRouteReportOnlyFinding,
   cancelIssueThreadInteractionSchema,
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
@@ -1464,7 +1466,67 @@ export function issueRoutes(
     return !!overrides &&
       typeof overrides === "object" &&
       !Array.isArray(overrides) &&
-      (overrides as Record<string, unknown>).modelProfile === "cheap";
+      (overrides as { modelProfile?: unknown }).modelProfile === "cheap";
+  }
+
+  function asRecord(value: unknown): Record<string, unknown> | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    return value as Record<string, unknown>;
+  }
+
+  function asNonEmptyString(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  function readFirstNonEmptyString(record: Record<string, unknown>, keys: string[]): string | null {
+    for (const key of keys) {
+      const value = asNonEmptyString(record[key]);
+      if (value) return value;
+    }
+    return null;
+  }
+
+  function collectEnvKeysPresent(adapterConfig: Record<string, unknown>): string[] {
+    const env = asRecord(adapterConfig.env);
+    return env ? Object.keys(env) : [];
+  }
+
+  async function auditIssueAssigneeAdapterOverridesReportOnly(input: {
+    companyId: string;
+    issueId: string;
+    assigneeAgentId?: string | null;
+    actorKind: "agent" | "user" | "system";
+    actorId?: string | null;
+    assigneeAdapterOverrides?: unknown;
+  }): Promise<{ mode: "report_only"; findings: ModelRouteReportOnlyFinding[] } | null> {
+    const overrides = asRecord(input.assigneeAdapterOverrides);
+    const adapterConfig = asRecord(overrides?.adapterConfig);
+    if (!adapterConfig) return null;
+
+    const assignee = input.assigneeAgentId ? await agentsSvc.getById(input.assigneeAgentId) : null;
+    const adapterType = assignee?.companyId === input.companyId ? assignee.adapterType : null;
+    const finding = auditModelRouteCandidateReportOnly({
+      path: "assigneeAdapterOverrides.adapterConfig",
+      candidate: {
+        companyId: input.companyId,
+        actorKind: input.actorKind,
+        actorId: input.actorId,
+        scopeKind: "issue",
+        scopeId: input.issueId,
+        adapterType,
+        adapterConfigPath: "assigneeAdapterOverrides.adapterConfig",
+        provider: readFirstNonEmptyString(adapterConfig, ["provider", "providerId", "modelProvider"]),
+        model: readFirstNonEmptyString(adapterConfig, ["model", "modelId", "modelName"]),
+        baseUrl: readFirstNonEmptyString(adapterConfig, ["baseUrl", "baseURL", "apiBaseUrl", "openAIBaseUrl"]),
+        envKeysPresent: collectEnvKeysPresent(adapterConfig),
+        usageCategory: "primary",
+        requestedModelProfile: asNonEmptyString(overrides?.modelProfile),
+      },
+    });
+
+    return finding ? { mode: "report_only", findings: [finding] } : null;
   }
 
   async function loadActorRunContext(req: Request, companyId: string) {
@@ -4361,6 +4423,14 @@ export function issueRoutes(
       reopened,
       blockedToTodoRecovery: statusChangedFromBlockedToTodo,
     });
+    const modelRouteAudit = await auditIssueAssigneeAdapterOverridesReportOnly({
+      companyId: issue.companyId,
+      issueId: issue.id,
+      assigneeAgentId: issue.assigneeAgentId,
+      actorKind: actor.actorType,
+      actorId: actor.actorId,
+      assigneeAdapterOverrides: issue.assigneeAdapterOverrides,
+    });
     if (activeRecoveryActionBeforeUpdate && !revalidatedRecoveryAction) {
       issueResponse = {
         ...issueResponse,
@@ -4392,6 +4462,7 @@ export function issueRoutes(
         ...(interruptedRunId ? { interruptedRunId } : {}),
         ...(cancelledStatusRunId ? { cancelledStatusRunId } : {}),
         ...(workspaceChange ? { workspaceChange } : {}),
+        ...(modelRouteAudit ? { modelRouteAudit } : {}),
         _previous: hasFieldChanges ? previous : undefined,
         ...summarizeIssueReferenceActivityDetails(
           updateReferenceDiff
