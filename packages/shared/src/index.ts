@@ -1,5 +1,20 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  EDIS_OPENROUTER_ALLOWED_MODELS,
+  EDIS_OPENROUTER_BLOCKED_PATTERNS,
+  EDIS_OPENROUTER_MODEL_ROUTE_POLICY,
+  type ModelRouteActorKind,
+  type ModelRouteCandidate,
+  type ModelRoutePolicy,
+  type ModelRoutePolicyDecision,
+  type ModelRouteScopeKind,
+  type ModelRouteUsageCategory,
+  type ModelRouteViolationCode,
+  type OpenRouterAllowedModelRoute,
+  type OpenRouterModelRouteTier,
+  type OpenRouterRoutePolicy,
+} from "./governance/model-route-policy.js";
+export {
   COMPANY_STATUSES,
   DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES,
   MAX_COMPANY_ATTACHMENT_MAX_BYTES,
