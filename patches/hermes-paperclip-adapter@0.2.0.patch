@@ -1,0 +1,87 @@
+diff --git a/dist/server/execute.js b/dist/server/execute.js
+index 93cddf8243271f5fb3ab101617f9114257e41328..16c5f23118c4fdaa10b34ee2c78774795a1fc20f 100644
+--- a/dist/server/execute.js
++++ b/dist/server/execute.js
+@@ -142,6 +142,8 @@ function buildPrompt(ctx, config) {
+ const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
+ /** Regex for legacy session output format */
+ const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
++/** Hermes session IDs look like: 20260526_194004_18f756 */
++const HERMES_SESSION_ID_FORMAT = /^\d{8}_\d{6}_[a-f0-9]{6}$/i;
+ /** Regex to extract token usage from Hermes output. */
+ const TOKEN_USAGE_REGEX = /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
+ /** Regex to extract cost from Hermes output. */
+@@ -190,23 +192,32 @@ function parseHermesOutput(stdout, stderr) {
+     //   <response text>
+     //
+     //   session_id: <id>
+-    const sessionMatch = stdout.match(SESSION_ID_REGEX);
+-    if (sessionMatch?.[1]) {
+-        result.sessionId = sessionMatch?.[1] ?? null;
+-        // The response is everything before the session_id line
++    // The session line may arrive on stdout or stderr depending on the Hermes
++    // transport/runtime. Only accept full Hermes session IDs; otherwise normal
++    // response prose like "session id from runtime..." can be mis-parsed as a
++    // resumable session id.
++    const sessionMatch = combined.match(SESSION_ID_REGEX);
++    if (sessionMatch?.[1] && HERMES_SESSION_ID_FORMAT.test(sessionMatch[1])) {
++        result.sessionId = sessionMatch[1];
++        // The response is everything before the session_id line when that line
++        // is actually present in stdout. If the session line is on stderr, keep
++        // the full stdout response and let cleanResponse strip noise.
+         const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
+         if (sessionLineIdx > 0) {
+             result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
+         }
+     }
+     else {
+-        // Legacy format (non-quiet mode)
++        // Legacy format (non-quiet mode). Validate the capture before using it.
+         const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
+-        if (legacyMatch?.[1]) {
+-            result.sessionId = legacyMatch?.[1] ?? null;
++        if (legacyMatch?.[1] && HERMES_SESSION_ID_FORMAT.test(legacyMatch[1])) {
++            result.sessionId = legacyMatch[1];
+         }
+-        // In non-quiet mode, extract clean response from stdout by
+-        // filtering out tool lines, system messages, and noise
++    }
++    if (!result.response) {
++        // In non-quiet mode, or when the session id line was emitted on stderr,
++        // extract clean response from stdout by filtering out tool lines, system
++        // messages, and noise.
+         const cleaned = cleanResponse(stdout);
+         if (cleaned.length > 0) {
+             result.response = cleaned;
+@@ -282,8 +293,21 @@ export async function execute(ctx) {
+     args.push("--source", "tool");
+     // Session resume
+     const prevSessionId = cfgString(ctx.runtime?.sessionParams?.sessionId);
++
++    // ── Session resume ─────────────────────────────────────────────────────
+     if (persistSession && prevSessionId) {
+-        args.push("--resume", prevSessionId);
++        // Validate prevSessionId against the Hermes session ID regex before using it.
++        if (HERMES_SESSION_ID_FORMAT.test(prevSessionId)) {
++            args.push("--resume", prevSessionId);
++            await ctx.onLog("stdout", `[hermes] Resuming session: ${prevSessionId}\n`);
++        }
++        else {
++            await ctx.onLog("stderr", `[hermes] Warning: Malformed session ID '${prevSessionId}' from previous run. Starting a fresh session.\n`);
++            // Clear the invalid session ID to prevent it from being re-persisted.
++            if (ctx.runtime?.sessionParams) {
++                ctx.runtime.sessionParams.sessionId = undefined;
++            }
++        }
+     }
+     if (extraArgs?.length) {
+         args.push(...extraArgs);
+@@ -382,7 +406,7 @@ export async function execute(ctx) {
+     // Store session ID for next run
+     if (persistSession && parsed.sessionId) {
+         executionResult.sessionParams = { sessionId: parsed.sessionId };
+-        executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
++        executionResult.sessionDisplayId = parsed.sessionId;
+     }
+     return executionResult;
+ }
