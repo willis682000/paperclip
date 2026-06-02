@@ -262,6 +262,44 @@ describe("server adapter registry", () => {
     });
   });
 
+  it("ignores unresolved managed PAPERCLIP secret refs before injecting hermes_local runtime auth", async () => {
+    const adapter = findActiveServerAdapter("hermes_local");
+    expect(adapter).not.toBeNull();
+
+    await adapter!.execute({
+      runId: "run-secret-ref",
+      agent: {
+        id: "agent-secret-ref",
+        companyId: "company-secret-ref",
+        name: "EDI",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          env: {
+            PAPERCLIP_API_KEY: { type: "secret_ref", secretId: "secret-api-key", version: "latest" },
+            PAPERCLIP_API_URL: { type: "secret_ref", secretId: "secret-api-url", version: "latest" },
+          },
+        },
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { env: { N8N_API_URL: "http://n8n.local", N8N_API_KEY: "resolved-n8n-key" } },
+      context: {},
+      onLog: async () => {},
+      authToken: "jwt-secret-ref-token",
+    });
+
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
+    const [ctx] = hermesExecuteMock.mock.calls[0];
+    expect(ctx.agent.adapterConfig).toMatchObject({
+      env: {
+        N8N_API_URL: "http://n8n.local",
+        N8N_API_KEY: "resolved-n8n-key",
+        PAPERCLIP_API_URL: "http://127.0.0.1:3100",
+        PAPERCLIP_API_KEY: "jwt-secret-ref-token",
+        PAPERCLIP_RUN_ID: "run-secret-ref",
+      },
+    });
+  });
+
   it("injects local auth token into external hermes_local overrides", async () => {
     const externalHermesExecute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
     const externalHermesAdapter: ServerAdapterModule = {
@@ -537,6 +575,7 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.env).toEqual({
       N8N_API_URL: "https://n8n.example.test",
       N8N_API_KEY: "resolved-n8n-key",
+      PAPERCLIP_API_URL: "http://127.0.0.1:3100",
       PAPERCLIP_API_KEY: "agent-run-jwt",
       PAPERCLIP_RUN_ID: "run-123",
     });

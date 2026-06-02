@@ -570,6 +570,10 @@ function readHermesEnvRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function isPaperclipRuntimeEnvKey(key: string) {
+  return key.startsWith("PAPERCLIP_");
+}
+
 function resolvedHermesRuntimeEnv(input: {
   agentEnv: unknown;
   runtimeEnv: unknown;
@@ -590,6 +594,15 @@ function resolvedHermesRuntimeEnv(input: {
       if (!Object.prototype.hasOwnProperty.call(resolved, key)) {
         resolved[key] = value;
       }
+      continue;
+    }
+    if (isPaperclipRuntimeEnvKey(key)) {
+      // PAPERCLIP_* values stored on agents may be secret_ref objects in the
+      // persisted adapter config. resolveExecutionRunAdapterConfig strips those
+      // managed runtime bindings before generic secret resolution so this auth
+      // wrapper can inject the authoritative run-scoped token below. Do not
+      // fail before injection just because the persisted raw agent config still
+      // contains an unresolved managed Paperclip secret ref.
       continue;
     }
     if (!Object.prototype.hasOwnProperty.call(resolved, key)) {
@@ -629,6 +642,10 @@ function withHermesLocalRuntimeAuth(adapter: ServerAdapterModule): ServerAdapter
       ].join("\n");
       const patchedEnv = {
         ...existingEnv,
+        PAPERCLIP_API_URL:
+          typeof existingEnv.PAPERCLIP_API_URL === "string" && existingEnv.PAPERCLIP_API_URL.trim().length > 0
+            ? existingEnv.PAPERCLIP_API_URL
+            : process.env.PAPERCLIP_API_URL ?? "http://127.0.0.1:3100",
         ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
         PAPERCLIP_RUN_ID: normalizedCtx.runId,
       };
