@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
+import { sessionCodec as hermesSessionCodec } from "hermes-paperclip-adapter/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   buildRealizedExecutionWorkspaceFromPersisted,
   buildExplicitResumeSessionOverride,
+  resolveNextSessionState,
+  resolvePersistedSessionIdAfter,
   deriveTaskKeyWithHeartbeatFallback,
   extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
@@ -495,6 +498,32 @@ describe("buildExplicitResumeSessionOverride", () => {
         sessionId: "session-after",
       },
     });
+  });
+});
+
+
+
+describe("resolveNextSessionState", () => {
+  it("keeps the full Hermes session id as the persisted/resumable id even when display state is truncated", () => {
+    const fullSessionId = "20260601_170747_563840";
+    const truncatedDisplayId = "20260601_170747_";
+
+    const result = resolveNextSessionState({
+      codec: hermesSessionCodec,
+      adapterResult: {
+        sessionId: fullSessionId,
+        sessionParams: { sessionId: fullSessionId },
+        sessionDisplayId: truncatedDisplayId,
+      } as never,
+      previousParams: null,
+      previousDisplayId: null,
+      previousLegacySessionId: null,
+    });
+
+    expect(result.params).toEqual({ sessionId: fullSessionId });
+    expect(result.displayId).toBe(truncatedDisplayId);
+    expect(result.legacySessionId).toBe(fullSessionId);
+    expect(resolvePersistedSessionIdAfter(result)).toBe(fullSessionId);
   });
 });
 

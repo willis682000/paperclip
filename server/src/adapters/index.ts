@@ -10,6 +10,7 @@ export {
   registerServerAdapter,
   unregisterServerAdapter,
   requireServerAdapter,
+  setModelRouteApprovalResolver,
 } from "./registry.js";
 export type {
   ServerAdapterModule,

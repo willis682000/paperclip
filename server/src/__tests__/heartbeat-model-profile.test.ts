@@ -4,6 +4,9 @@ import {
   type AdapterModelProfileDefinition,
 } from "../adapters/index.js";
 import {
+  approvalRecordToAuthoritativeModelRouteApproval,
+  assertRequestedModelProfileApplied,
+  costTierRouteMetadata,
   mergeModelProfileAdapterConfig,
   normalizeModelProfileWakeContext,
   resolveModelProfileApplication,
@@ -73,6 +76,18 @@ describe("heartbeat model profile application", () => {
       modelReasoningEffort: "low",
       approvalPolicy: "strict",
     });
+    expect(costTierRouteMetadata({
+      modelProfile,
+      provider: "openai-codex",
+      model: "adapter-cheap",
+    })).toMatchObject({
+      costTier: "cheap",
+      provider: "openai-codex",
+      model: "adapter-cheap",
+      routeReason: "cheap_model_profile_applied",
+      fallbackUsed: false,
+      failClosed: false,
+    });
   });
 
   it("lets agent runtime profile config customize adapter defaults", () => {
@@ -103,7 +118,7 @@ describe("heartbeat model profile application", () => {
     });
   });
 
-  it("falls back to the primary config when the adapter does not support the requested profile", () => {
+  it("fails closed instead of falling back to the primary config when the requested profile is unsupported", () => {
     const modelProfile = resolveModelProfileApplication({
       adapterModelProfiles: [],
       agentRuntimeConfig: {
@@ -119,21 +134,51 @@ describe("heartbeat model profile application", () => {
       contextSnapshot: { modelProfile: "cheap" },
     });
 
-    const merged = mergeModelProfileAdapterConfig({
-      baseConfig: {
-        model: "primary",
-      },
-      modelProfile,
-      issueAdapterConfig: null,
-    });
-
     expect(modelProfile).toMatchObject({
       requested: "cheap",
       applied: null,
       fallbackReason: "adapter_profile_not_supported",
       adapterConfig: null,
     });
-    expect(merged).toEqual({ model: "primary" });
+    expect(() => assertRequestedModelProfileApplied(modelProfile)).toThrow(
+      /refusing to fall back to the primary model/,
+    );
+    expect(costTierRouteMetadata({ modelProfile })).toMatchObject({
+      costTier: "primary",
+      routeReason: "cheap_model_profile_requested_but_not_applied",
+      fallbackUsed: true,
+      failClosed: true,
+    });
+  });
+
+  it("does not request cheap for status-only recovery when the adapter lacks a cheap profile", () => {
+    const modelProfile = resolveModelProfileApplication({
+      adapterModelProfiles: [],
+      agentRuntimeConfig: {},
+      issueModelProfile: null,
+      contextSnapshot: {
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+        modelProfile: "cheap",
+      },
+    });
+
+    expect(modelProfile).toMatchObject({
+      requested: null,
+      requestedBy: null,
+      applied: null,
+      fallbackReason: null,
+      adapterConfig: null,
+    });
+    expect(() => assertRequestedModelProfileApplied(modelProfile)).not.toThrow();
+    expect(costTierRouteMetadata({ modelProfile })).toMatchObject({
+      costTier: "primary",
+      routeReason: "primary_model_work",
+      fallbackUsed: false,
+      failClosed: false,
+    });
   });
 
   it("normalizes a wake payload model profile into run context", () => {
@@ -143,5 +188,69 @@ describe("heartbeat model profile application", () => {
     });
 
     expect(contextSnapshot).toMatchObject({ modelProfile: "cheap" });
+  });
+
+  it("accepts only authoritative approved model-route records matching the run context", () => {
+    const candidate = {
+      companyId: "company-1",
+      actorKind: "agent" as const,
+      actorId: "agent-1",
+      scopeKind: "issue" as const,
+      scopeId: "issue-1",
+      provider: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      usageCategory: "coding_fallback" as const,
+      runId: "run-1",
+      approvalId: "approval-1",
+    };
+    const approvedRecord = {
+      id: "approval-1",
+      companyId: "company-1",
+      type: "model_route",
+      status: "approved",
+      decidedByUserId: "operator-1",
+      decidedAt: new Date("2026-01-01T00:00:00.000Z"),
+      payload: {
+        provider: "openrouter",
+        model: "openai/gpt-4.1-mini",
+        usageCategory: "coding_fallback",
+        scopeKind: "issue",
+        scopeId: "issue-1",
+        actorKind: "agent",
+        actorId: "agent-1",
+        runId: "run-1",
+        expiresAt: "2999-01-01T00:00:00.000Z",
+      },
+    };
+
+    expect(approvalRecordToAuthoritativeModelRouteApproval(candidate, approvedRecord)).toEqual({
+      id: "approval-1",
+      provider: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      usageCategory: "coding_fallback",
+      scopeKind: "issue",
+      scopeId: "issue-1",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+
+    for (const status of ["pending", "rejected", "revoked", "cancelled"]) {
+      expect(approvalRecordToAuthoritativeModelRouteApproval(candidate, {
+        ...approvedRecord,
+        status,
+      })).toBeNull();
+    }
+
+    expect(approvalRecordToAuthoritativeModelRouteApproval(candidate, {
+      ...approvedRecord,
+      payload: { ...approvedRecord.payload, runId: "other-run" },
+    })).toBeNull();
+    expect(approvalRecordToAuthoritativeModelRouteApproval(candidate, {
+      ...approvedRecord,
+      payload: { ...approvedRecord.payload, actorId: "other-agent" },
+    })).toBeNull();
+    expect(approvalRecordToAuthoritativeModelRouteApproval(candidate, {
+      ...approvedRecord,
+      payload: { ...approvedRecord.payload, scopeId: "other-issue" },
+    })).toBeNull();
   });
 });

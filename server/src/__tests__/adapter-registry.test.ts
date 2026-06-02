@@ -36,6 +36,7 @@ import {
 } from "../adapters/index.js";
 import {
   resolveExternalAdapterRegistration,
+  setModelRouteApprovalResolver,
   setOverridePaused,
 } from "../adapters/registry.js";
 
@@ -60,13 +61,19 @@ describe("server adapter registry", () => {
   beforeEach(() => {
     unregisterServerAdapter("external_test");
     unregisterServerAdapter("claude_local");
+    unregisterServerAdapter("hermes_local");
     setOverridePaused("claude_local", false);
+    setOverridePaused("hermes_local", false);
+    setModelRouteApprovalResolver(null);
   });
 
   afterEach(() => {
     unregisterServerAdapter("external_test");
     unregisterServerAdapter("claude_local");
+    unregisterServerAdapter("hermes_local");
     setOverridePaused("claude_local", false);
+    setOverridePaused("hermes_local", false);
+    setModelRouteApprovalResolver(null);
     hermesExecuteMock.mockClear();
   });
 
@@ -192,6 +199,114 @@ describe("server adapter registry", () => {
     expect(adapter!.instructionsPathKey).toBe("instructionsFilePath");
     expect(adapter!.requiresMaterializedRuntimeSkills).toBe(false);
     expect(adapter!.supportsLocalAgentJwt).toBe(true);
+  });
+
+  it("injects local auth token and run id into built-in hermes_local adapter env", async () => {
+    const adapter = findActiveServerAdapter("hermes_local");
+    expect(adapter).not.toBeNull();
+
+    await adapter!.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "EDI",
+        adapterType: "hermes_local",
+        adapterConfig: { env: { EDI_PAPERCLIP_API_KEY: "fallback-token" } },
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {},
+      context: {},
+      onLog: async () => {},
+      authToken: "jwt-token",
+    });
+
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
+    const [ctx] = hermesExecuteMock.mock.calls[0];
+    expect(ctx.agent.adapterConfig).toMatchObject({
+      env: {
+        EDI_PAPERCLIP_API_KEY: "fallback-token",
+        PAPERCLIP_API_KEY: "jwt-token",
+        PAPERCLIP_RUN_ID: "run-123",
+      },
+    });
+  });
+
+  it("preserves explicit hermes_local PAPERCLIP_API_KEY while still injecting run id", async () => {
+    const adapter = findActiveServerAdapter("hermes_local");
+    expect(adapter).not.toBeNull();
+
+    await adapter!.execute({
+      runId: "run-456",
+      agent: {
+        id: "agent-456",
+        companyId: "company-456",
+        name: "EDI",
+        adapterType: "hermes_local",
+        adapterConfig: { env: { PAPERCLIP_API_KEY: "existing-token" } },
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {},
+      context: {},
+      onLog: async () => {},
+      authToken: "jwt-token",
+    });
+
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
+    const [ctx] = hermesExecuteMock.mock.calls[0];
+    expect(ctx.agent.adapterConfig).toMatchObject({
+      env: {
+        PAPERCLIP_API_KEY: "existing-token",
+        PAPERCLIP_RUN_ID: "run-456",
+      },
+    });
+  });
+
+  it("injects local auth token into external hermes_local overrides", async () => {
+    const externalHermesExecute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
+    const externalHermesAdapter: ServerAdapterModule = {
+      type: "hermes_local",
+      execute: externalHermesExecute,
+      testEnvironment: async () => ({
+        adapterType: "hermes_local",
+        status: "pass" as const,
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+      supportsLocalAgentJwt: true,
+    };
+
+    registerServerAdapter(externalHermesAdapter);
+
+    const adapter = findActiveServerAdapter("hermes_local");
+    expect(adapter).not.toBeNull();
+    expect(adapter).not.toBe(externalHermesAdapter);
+
+    await adapter!.execute({
+      runId: "run-external",
+      agent: {
+        id: "agent-external",
+        companyId: "company-external",
+        name: "EDI",
+        adapterType: "hermes_local",
+        adapterConfig: { env: { EDI_PAPERCLIP_API_KEY: "fallback-token" } },
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {},
+      context: {},
+      onLog: async () => {},
+      authToken: "external-jwt-token",
+    });
+
+    expect(externalHermesExecute).toHaveBeenCalledTimes(1);
+    const [ctx] = externalHermesExecute.mock.calls[0];
+    expect(ctx.agent.adapterConfig).toMatchObject({
+      env: {
+        EDI_PAPERCLIP_API_KEY: "fallback-token",
+        PAPERCLIP_API_KEY: "external-jwt-token",
+        PAPERCLIP_RUN_ID: "run-external",
+      },
+    });
   });
 
   it("built-in local adapters declare cheap model profile defaults where supported", async () => {
@@ -385,6 +500,78 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
   });
 
+  it("injects Hermes auth into resolved runtime env without reintroducing secret-reference objects", async () => {
+    const adapter = requireServerAdapter("hermes_local");
+
+    await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "engineer",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          env: {
+            N8N_API_URL: { type: "secret_ref", secretId: "secret-url", version: "latest" },
+            N8N_API_KEY: { type: "secret_ref", secretId: "secret-key", version: "latest" },
+          },
+        },
+      },
+      runtime: {},
+      config: {
+        env: {
+          N8N_API_URL: "https://n8n.example.test",
+          N8N_API_KEY: "resolved-n8n-key",
+        },
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    expect(patchedCtx.agent.adapterConfig.env).toEqual({
+      N8N_API_URL: "https://n8n.example.test",
+      N8N_API_KEY: "resolved-n8n-key",
+      PAPERCLIP_API_KEY: "agent-run-jwt",
+      PAPERCLIP_RUN_ID: "run-123",
+    });
+    expect(patchedCtx.config.env).toEqual(patchedCtx.agent.adapterConfig.env);
+    expect(Object.values(patchedCtx.config.env)).not.toContain("[object Object]");
+  });
+
+  it("fails closed when Hermes runtime env still contains unresolved secret-reference objects", async () => {
+    const adapter = requireServerAdapter("hermes_local");
+
+    await expect(adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "engineer",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          env: {
+            N8N_API_KEY: { type: "secret_ref", secretId: "secret-key", version: "latest" },
+          },
+        },
+      },
+      runtime: {},
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    })).rejects.toThrow("Unresolved Hermes runtime environment binding for N8N_API_KEY");
+    expect(hermesExecuteMock).not.toHaveBeenCalled();
+  });
+
   it("passes the original Hermes context through when authToken is absent", async () => {
     const adapter = requireServerAdapter("hermes_local");
     const ctx = {
@@ -479,6 +666,240 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.promptTemplate).toBeUndefined();
     // Auth token is still injected.
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
+  });
+
+  it("blocks unapproved OpenRouter adapter routes before adapter execution", async () => {
+    const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
+    const onMeta = vi.fn(async () => {});
+    registerServerAdapter({
+      type: "external_test",
+      execute,
+      testEnvironment: async () => ({
+        adapterType: "external_test",
+        status: "pass" as const,
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+    });
+
+    const adapter = requireServerAdapter("external_test");
+    await expect(
+      adapter.execute({
+        runId: "run-openrouter-denied",
+        agent: {
+          id: "agent-123",
+          companyId: "company-123",
+          name: "OpenRouter Agent",
+          adapterType: "external_test",
+          adapterConfig: {},
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          provider: "openrouter",
+          model: "openai/gpt-4.1-mini",
+        },
+        context: { issueId: "issue-123" },
+        onLog: async () => {},
+        onMeta,
+      }),
+    ).rejects.toThrow("OpenRouter routes require recorded approval before use.");
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(onMeta).toHaveBeenCalledWith(expect.objectContaining({
+      adapterType: "external_test",
+      command: "model-route-policy:denied",
+      context: expect.objectContaining({
+        modelRoutePolicy: expect.objectContaining({
+          event: "denied",
+          allowed: false,
+          violationCode: "policy_openrouter_approval_required",
+          runId: "run-openrouter-denied",
+        }),
+      }),
+    }));
+  });
+
+  it("blocks spoofed OpenRouter approval supplied only by adapter config", async () => {
+    const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
+    const onMeta = vi.fn(async () => {});
+    registerServerAdapter({
+      type: "external_test",
+      execute,
+      testEnvironment: async () => ({
+        adapterType: "external_test",
+        status: "pass" as const,
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+    });
+
+    const adapter = requireServerAdapter("external_test");
+    await expect(adapter.execute({
+      runId: "run-openrouter-spoofed",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "OpenRouter Agent",
+        adapterType: "external_test",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        provider: "openrouter",
+        model: "openai/gpt-4.1-mini",
+        modelRouteUsageCategory: "coding_fallback",
+        modelRouteApproval: {
+          id: "spoofed-approval-123",
+          provider: "openrouter",
+          model: "openai/gpt-4.1-mini",
+          usageCategory: "coding_fallback",
+          scopeKind: "issue",
+          scopeId: "issue-123",
+          expiresAt: "2999-01-01T00:00:00.000Z",
+        },
+      },
+      context: { issueId: "issue-123" },
+      onLog: async () => {},
+      onMeta,
+    })).rejects.toThrow("OpenRouter routes require recorded approval before use.");
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(onMeta).toHaveBeenCalledWith(expect.objectContaining({
+      adapterType: "external_test",
+      command: "model-route-policy:denied",
+      context: expect.objectContaining({
+        modelRoutePolicy: expect.objectContaining({
+          event: "denied",
+          allowed: false,
+          violationCode: "policy_openrouter_approval_required",
+          runId: "run-openrouter-spoofed",
+        }),
+      }),
+    }));
+  });
+
+  it("allows OpenRouter routes with authoritative approval resolver and records approval metadata", async () => {
+    const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
+    const onMeta = vi.fn(async () => {});
+    const approvalResolver = vi.fn(async () => ({
+      id: "approval-123",
+      provider: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      usageCategory: "coding_fallback" as const,
+      scopeKind: "issue" as const,
+      scopeId: "issue-123",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    }));
+    setModelRouteApprovalResolver(approvalResolver);
+    registerServerAdapter({
+      type: "external_test",
+      execute,
+      testEnvironment: async () => ({
+        adapterType: "external_test",
+        status: "pass" as const,
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+    });
+
+    const adapter = requireServerAdapter("external_test");
+    await expect(adapter.execute({
+      runId: "run-openrouter-approved",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "OpenRouter Agent",
+        adapterType: "external_test",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        provider: "openrouter",
+        model: "openai/gpt-4.1-mini",
+        modelRouteUsageCategory: "coding_fallback",
+        modelRouteApprovalId: "approval-123",
+      },
+      context: { issueId: "issue-123" },
+      onLog: async () => {},
+      onMeta,
+    })).resolves.toMatchObject({ exitCode: 0 });
+
+    expect(approvalResolver).toHaveBeenCalledWith(expect.objectContaining({
+      approvalId: "approval-123",
+      companyId: "company-123",
+      scopeKind: "issue",
+      scopeId: "issue-123",
+    }));
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(onMeta).toHaveBeenCalledWith(expect.objectContaining({
+      adapterType: "external_test",
+      command: "model-route-policy:approved",
+      context: expect.objectContaining({
+        modelRoutePolicy: expect.objectContaining({
+          event: "approved",
+          allowed: true,
+          approvalId: "approval-123",
+          approvalSource: "authoritative_resolver",
+          runId: "run-openrouter-approved",
+        }),
+      }),
+    }));
+  });
+
+  it("fails closed when authoritative approval lookup is unavailable", async () => {
+    const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
+    const onMeta = vi.fn(async () => {});
+    const approvalResolver = vi.fn(async () => {
+      throw new Error("approval store unavailable");
+    });
+    setModelRouteApprovalResolver(approvalResolver);
+    registerServerAdapter({
+      type: "external_test",
+      execute,
+      testEnvironment: async () => ({
+        adapterType: "external_test",
+        status: "pass" as const,
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+    });
+
+    const adapter = requireServerAdapter("external_test");
+    await expect(adapter.execute({
+      runId: "run-openrouter-unavailable-approval",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "OpenRouter Agent",
+        adapterType: "external_test",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        provider: "openrouter",
+        model: "openai/gpt-4.1-mini",
+        modelRouteUsageCategory: "coding_fallback",
+        modelRouteApprovalId: "approval-123",
+      },
+      context: { issueId: "issue-123" },
+      onLog: async () => {},
+      onMeta,
+    })).rejects.toThrow("OpenRouter routes require recorded approval before use.");
+
+    expect(approvalResolver).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    expect(onMeta).toHaveBeenCalledWith(expect.objectContaining({
+      adapterType: "external_test",
+      command: "model-route-policy:denied",
+      context: expect.objectContaining({
+        modelRoutePolicy: expect.objectContaining({
+          event: "denied",
+          allowed: false,
+          violationCode: "policy_openrouter_approval_required",
+          runId: "run-openrouter-unavailable-approval",
+        }),
+      }),
+    }));
   });
 });
 

@@ -190,6 +190,22 @@ describe("EDIS OpenRouter model route policy", () => {
     }
   });
 
+  it("denies OpenRouter GPT-5.5 instead of treating it as the primary route", () => {
+    const decision = evaluateModelRoutePolicy({
+      companyId: "company-1",
+      actorKind: "agent",
+      scopeKind: "issue",
+      provider: "openrouter",
+      model: "openai/gpt-5.5",
+      usageCategory: "primary",
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (!decision.allowed) {
+      expect(decision.violationCode).toBe("policy_model_not_allowlisted");
+    }
+  });
+
   it("returns report-only audit warnings without blocking OpenRouter violations", () => {
     const finding = auditModelRouteCandidateReportOnly({
       candidate: {
@@ -285,5 +301,74 @@ describe("EDIS OpenRouter model route policy", () => {
       approvalId: "approval-1",
       warnings: [],
     });
+  });
+
+  it("fails closed for expired OpenRouter approval data", () => {
+    const decision = evaluateModelRoutePolicy({
+      companyId: "company-1",
+      actorKind: "agent",
+      actorId: "agent-1",
+      scopeKind: "issue",
+      scopeId: "issue-1",
+      provider: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      usageCategory: "coding_fallback",
+    }, {
+      now: new Date("2026-01-01T00:00:00.000Z"),
+      approval: {
+        id: "approval-expired",
+        provider: "openrouter",
+        model: "openai/gpt-4.1-mini",
+        usageCategory: "coding_fallback",
+        scopeKind: "issue",
+        scopeId: "issue-1",
+        expiresAt: "2025-12-31T23:59:59.000Z",
+      },
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (!decision.allowed) {
+      expect(decision.violationCode).toBe("policy_openrouter_approval_required");
+    }
+  });
+
+  it("fails closed for mismatched OpenRouter approval fields", () => {
+    const candidate: ModelRouteCandidate = {
+      companyId: "company-1",
+      actorKind: "agent",
+      actorId: "agent-1",
+      scopeKind: "issue",
+      scopeId: "issue-1",
+      provider: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      usageCategory: "coding_fallback",
+    };
+
+    const mismatches = [
+      { model: "google/gemini-2.5-flash" },
+      { usageCategory: "emergency_backup" as const },
+      { scopeKind: "agent" as const },
+      { scopeId: "issue-2" },
+    ];
+
+    for (const mismatch of mismatches) {
+      const decision = evaluateModelRoutePolicy(candidate, {
+        approval: {
+          id: "approval-mismatch",
+          provider: "openrouter",
+          model: "openai/gpt-4.1-mini",
+          usageCategory: "coding_fallback",
+          scopeKind: "issue",
+          scopeId: "issue-1",
+          expiresAt: "2999-01-01T00:00:00.000Z",
+          ...mismatch,
+        },
+      });
+
+      expect(decision.allowed).toBe(false);
+      if (!decision.allowed) {
+        expect(decision.violationCode).toBe("policy_openrouter_approval_required");
+      }
+    }
   });
 });

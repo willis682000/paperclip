@@ -18,6 +18,8 @@ import {
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
   type ModelProfileKey,
+  type ModelRouteApproval,
+  type ModelRouteCandidate,
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
 } from "@paperclipai/shared";
@@ -53,7 +55,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, listAdapterModelProfiles, runningProcesses, setModelRouteApprovalResolver } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -146,6 +148,7 @@ import {
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
+  isStatusOnlyRecoveryGuardContext,
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
@@ -1068,6 +1071,7 @@ interface ParsedIssueAssigneeAdapterOverrides {
 
 type ModelProfileRequestSource = "issue_override" | "wake_context";
 type AppliedModelProfileConfigSource = "agent_runtime" | "adapter_default";
+export type PaperclipCostTier = "no_llm" | "cheap" | "primary";
 
 export interface ModelProfileApplication {
   requested: ModelProfileKey | null;
@@ -1076,6 +1080,16 @@ export interface ModelProfileApplication {
   configSource: AppliedModelProfileConfigSource | null;
   fallbackReason: string | null;
   adapterConfig: Record<string, unknown> | null;
+}
+
+export interface CostTierRouteMetadata {
+  costTier: PaperclipCostTier;
+  provider: string | null;
+  model: string | null;
+  routeReason: string;
+  fallbackUsed: boolean;
+  failClosed: boolean;
+  modelProfile?: Record<string, unknown>;
 }
 
 export type ResolvedWorkspaceForRun = {
@@ -1181,6 +1195,19 @@ export function resolveModelProfileApplication(input: {
 
   const adapterProfile = input.adapterModelProfiles.find((profile) => profile.key === requested) ?? null;
   if (!adapterProfile) {
+    const unsupportedStatusOnlyRecoveryCheapRequest = requested === "cheap"
+      && isStatusOnlyRecoveryGuardContext(input.contextSnapshot);
+    if (unsupportedStatusOnlyRecoveryCheapRequest) {
+      return {
+        requested: null,
+        requestedBy: null,
+        applied: null,
+        configSource: null,
+        fallbackReason: null,
+        adapterConfig: null,
+      };
+    }
+
     return {
       requested,
       requestedBy,
@@ -1238,6 +1265,52 @@ function modelProfileRunMetadata(
     applied: modelProfile.applied,
     configSource: modelProfile.configSource,
     fallbackReason: modelProfile.fallbackReason,
+  };
+}
+
+export function costTierRouteMetadata(input: {
+  modelProfile: ModelProfileApplication;
+  provider?: string | null;
+  model?: string | null;
+  routeReason?: string | null;
+}): CostTierRouteMetadata {
+  const requestedCheap = input.modelProfile.requested === "cheap";
+  const appliedCheap = input.modelProfile.applied === "cheap";
+  const modelProfileMetadata = modelProfileRunMetadata(input.modelProfile);
+  const provider = readNonEmptyString(input.provider) ?? null;
+  const model = readNonEmptyString(input.model) ?? null;
+  return {
+    costTier: appliedCheap ? "cheap" : "primary",
+    provider,
+    model,
+    routeReason:
+      readNonEmptyString(input.routeReason)
+      ?? (appliedCheap
+        ? "cheap_model_profile_applied"
+        : requestedCheap
+          ? "cheap_model_profile_requested_but_not_applied"
+          : "primary_model_work"),
+    fallbackUsed: Boolean(input.modelProfile.fallbackReason),
+    failClosed: requestedCheap && !appliedCheap,
+    ...(modelProfileMetadata ? { modelProfile: modelProfileMetadata } : {}),
+  };
+}
+
+export function assertRequestedModelProfileApplied(modelProfile: ModelProfileApplication): void {
+  if (!modelProfile.requested || modelProfile.applied) return;
+  const reason = modelProfile.fallbackReason ?? "model_profile_not_applied";
+  throw new Error(
+    `Requested model profile ${modelProfile.requested} could not be applied (${reason}); refusing to fall back to the primary model`,
+  );
+}
+
+function mergeCostTierRouteMetadata(
+  resultJson: Record<string, unknown> | null,
+  route: CostTierRouteMetadata,
+): Record<string, unknown> | null {
+  return {
+    ...(resultJson ?? {}),
+    costTierRoute: route,
   };
 }
 
@@ -2441,7 +2514,7 @@ function normalizeSessionParams(params: Record<string, unknown> | null | undefin
   return Object.keys(params).length > 0 ? params : null;
 }
 
-function resolveNextSessionState(input: {
+export function resolveNextSessionState(input: {
   codec: AdapterSessionCodec;
   adapterResult: AdapterExecutionResult;
   previousParams: Record<string, unknown> | null;
@@ -2498,7 +2571,67 @@ function resolveNextSessionState(input: {
   };
 }
 
+export function resolvePersistedSessionIdAfter(input: {
+  legacySessionId: string | null;
+  displayId: string | null;
+}) {
+  return input.legacySessionId ?? input.displayId;
+}
+
 export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeService>;
+
+type ModelRouteApprovalRecord = {
+  id: string;
+  companyId: string;
+  type: string;
+  status: string;
+  payload: Record<string, unknown> | null;
+  decidedByUserId?: string | null;
+  decidedAt?: Date | string | null;
+};
+
+export function approvalRecordToAuthoritativeModelRouteApproval(
+  candidate: ModelRouteCandidate,
+  approval: ModelRouteApprovalRecord | null,
+): ModelRouteApproval | null {
+  if (!approval) return null;
+  if (approval.companyId !== candidate.companyId) return null;
+  if (approval.type !== "model_route") return null;
+  if (approval.status !== "approved") return null;
+  if (!readNonEmptyString(approval.decidedByUserId) || !approval.decidedAt) return null;
+
+  const payload = approval.payload && typeof approval.payload === "object" && !Array.isArray(approval.payload)
+    ? approval.payload
+    : null;
+  if (!payload) return null;
+  if (readNonEmptyString(payload.provider) !== "openrouter") return null;
+
+  const model = readNonEmptyString(payload.model);
+  const usageCategory = readNonEmptyString(payload.usageCategory) as ModelRouteApproval["usageCategory"] | null;
+  const scopeKind = readNonEmptyString(payload.scopeKind) as ModelRouteApproval["scopeKind"] | null;
+  const expiresAt = readNonEmptyString(payload.expiresAt);
+  if (!model || !usageCategory || !scopeKind || !expiresAt) return null;
+
+  const scopeId = readNonEmptyString(payload.scopeId);
+  if (scopeKind !== candidate.scopeKind) return null;
+  if ((scopeId ?? null) !== (candidate.scopeId ?? null)) return null;
+  const payloadRunId = readNonEmptyString(payload.runId);
+  if (payloadRunId && payloadRunId !== candidate.runId) return null;
+  const payloadActorKind = readNonEmptyString(payload.actorKind);
+  if (payloadActorKind && payloadActorKind !== candidate.actorKind) return null;
+  const payloadActorId = readNonEmptyString(payload.actorId);
+  if (payloadActorId && payloadActorId !== (candidate.actorId ?? null)) return null;
+
+  return {
+    id: approval.id,
+    provider: "openrouter",
+    model,
+    usageCategory,
+    scopeKind,
+    scopeId,
+    expiresAt,
+  };
+}
 
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
@@ -2533,7 +2666,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const budgets = budgetService(db, budgetHooks);
   const recovery = recoveryService(db, { enqueueWakeup });
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
+  setModelRouteApprovalResolver(resolveAuthoritativeModelRouteApprovalRecord);
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
+
+  async function resolveAuthoritativeModelRouteApprovalRecord(
+    candidate: ModelRouteCandidate,
+  ): Promise<ModelRouteApproval | null> {
+    const approvalId = readNonEmptyString(candidate.approvalId);
+    if (!approvalId) return null;
+
+    const approval = await db
+      .select()
+      .from(approvals)
+      .where(and(eq(approvals.id, approvalId), eq(approvals.companyId, candidate.companyId)))
+      .then((rows) => rows[0] ?? null);
+    return approvalRecordToAuthoritativeModelRouteApproval(candidate, approval);
+  }
 
   async function releaseEnvironmentLeasesForRun(input: {
     runId: string;
@@ -7366,12 +7514,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       profileResolutionFallbackReason,
     });
     const modelProfileMetadata = modelProfileRunMetadata(modelProfileApplication);
+    const plannedCostTierRoute = costTierRouteMetadata({
+      modelProfile: modelProfileApplication,
+      routeReason: modelProfileApplication.applied === "cheap"
+        ? "cheap_model_profile_applied_before_adapter_launch"
+        : modelProfileApplication.requested === "cheap"
+          ? "cheap_model_profile_unavailable_fail_closed"
+          : "primary_model_work_before_adapter_launch",
+    });
+    context.paperclipCostTierRoute = plannedCostTierRoute;
     if (modelProfileMetadata) {
       context.paperclipModelProfile = modelProfileMetadata;
       if (modelProfileApplication.requested) context.modelProfile = modelProfileApplication.requested;
     } else {
       delete context.paperclipModelProfile;
+      delete context.modelProfile;
     }
+    assertRequestedModelProfileApplied(modelProfileApplication);
     const mergedConfig = mergeModelProfileAdapterConfig({
       baseConfig: persistedWorkspaceManagedConfig,
       modelProfile: modelProfileApplication,
@@ -8193,6 +8352,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? "timed_out"
               : "failed";
 
+      const finalCostTierRoute = costTierRouteMetadata({
+        modelProfile: modelProfileApplication,
+        provider: adapterResult.provider ?? null,
+        model: adapterResult.model ?? null,
+        routeReason: modelProfileApplication.applied === "cheap"
+          ? "cheap_model_profile_applied"
+          : "primary_model_work",
+      });
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
           ? ({
@@ -8216,18 +8383,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               model: readNonEmptyString(adapterResult.model) ?? "unknown",
               ...(adapterResult.costUsd != null ? { costUsd: adapterResult.costUsd } : {}),
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
+              costTierRoute: finalCostTierRoute,
             } as Record<string, unknown>)
-          : null;
+          : { costTierRoute: finalCostTierRoute };
 
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
-          resultJson: mergeModelProfileRunMetadata(
-            mergeAdapterRecoveryMetadata({
-              resultJson: adapterResult.resultJson ?? null,
-              errorFamily: adapterResult.errorFamily ?? null,
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
-            }),
-            modelProfileApplication,
+          resultJson: mergeCostTierRouteMetadata(
+            mergeModelProfileRunMetadata(
+              mergeAdapterRecoveryMetadata({
+                resultJson: adapterResult.resultJson ?? null,
+                errorFamily: adapterResult.errorFamily ?? null,
+                retryNotBefore: adapterResult.retryNotBefore ?? null,
+              }),
+              modelProfileApplication,
+            ),
+            finalCostTierRoute,
           ),
           errorCode: runErrorCode,
           errorMessage: runErrorMessage,
@@ -8243,7 +8414,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         signal: adapterResult.signal,
         usageJson,
         resultJson: persistedResultJson,
-        sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        sessionIdAfter: resolvePersistedSessionIdAfter(nextSessionState),
         stdoutExcerpt,
         stderrExcerpt,
         logBytes: logSummary?.bytes,

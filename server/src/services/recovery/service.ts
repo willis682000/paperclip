@@ -2025,7 +2025,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           reason: "no_invokable_recovery_owner",
         },
       monitorPolicy: null,
-      maxAttempts: null,
+      maxAttempts: 1,
       lastAttemptAt: now,
     });
 
@@ -2039,6 +2039,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause: StrandedRecoveryCause;
   }) {
     if (!input.action.ownerAgentId) return;
+    if (input.action.maxAttempts != null && input.action.attemptCount > input.action.maxAttempts) {
+      return;
+    }
     await deps.enqueueWakeup(input.action.ownerAgentId, {
       source: "assignment",
       triggerDetail: "system",

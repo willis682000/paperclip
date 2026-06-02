@@ -316,7 +316,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
     expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
       issueId: sourceIssue.id,
       sourceIssueId: sourceIssue.id,
@@ -370,13 +370,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: secondLatestRun.id });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[1]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      strandedRunId: secondLatestRun.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {

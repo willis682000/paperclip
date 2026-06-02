@@ -1,9 +1,16 @@
 import type {
+  AdapterExecutionContext,
   AdapterModel,
   AdapterModelProfileDefinition,
   AdapterRuntimeCommandSpec,
   ServerAdapterModule,
 } from "./types.js";
+import {
+  evaluateModelRoutePolicy,
+  type ModelRouteApproval,
+  type ModelRouteCandidate,
+  type ModelRouteUsageCategory,
+} from "@paperclipai/shared";
 import {
   buildSandboxNpmInstallCommand,
   getAdapterSessionManagement,
@@ -437,56 +444,228 @@ const piLocalAdapter: ServerAdapterModule = {
 // intentional until hermes ships a matching AdapterExecutionContext type.
 const executeHermesLocal = hermesExecute as unknown as ServerAdapterModule["execute"];
 
-const hermesLocalAdapter: ServerAdapterModule = {
-  type: "hermes_local",
-  execute: async (ctx) => {
-    const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
+function readStringConfigValue(config: Record<string, unknown>, key: string): string | null {
+  const value = config[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
 
-    const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
-    const existingEnv =
-      typeof existingConfig.env === "object" && existingConfig.env !== null && !Array.isArray(existingConfig.env)
-        ? (existingConfig.env as Record<string, string>)
-        : {};
-    const explicitApiKey =
-      typeof existingEnv.PAPERCLIP_API_KEY === "string" && existingEnv.PAPERCLIP_API_KEY.trim().length > 0;
-    const promptTemplate =
-      typeof existingConfig.promptTemplate === "string" && existingConfig.promptTemplate.trim().length > 0
-        ? existingConfig.promptTemplate
-        : "";
-    const authGuardPrompt = [
-      "Paperclip API safety rule:",
-      "Use Authorization: Bearer $PAPERCLIP_API_KEY on every Paperclip API request.",
-      "Use X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID on every Paperclip API request that writes or mutates data, including comments and issue updates.",
-      "Never use a board, browser, or local-board session for Paperclip API writes.",
-    ].join("\n");
+function readRecordConfigValue(config: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  const value = config[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
 
-    const patchedConfig: Record<string, unknown> = {
-      ...existingConfig,
-      env: {
+export type ModelRouteApprovalResolver = (
+  candidate: ModelRouteCandidate,
+) => Promise<ModelRouteApproval | null> | ModelRouteApproval | null;
+
+let modelRouteApprovalResolver: ModelRouteApprovalResolver | null = null;
+
+export function setModelRouteApprovalResolver(resolver: ModelRouteApprovalResolver | null): void {
+  modelRouteApprovalResolver = resolver;
+}
+
+async function resolveAuthoritativeModelRouteApproval(
+  candidate: ModelRouteCandidate,
+): Promise<ModelRouteApproval | null> {
+  if (!modelRouteApprovalResolver) return null;
+  try {
+    return await modelRouteApprovalResolver(candidate);
+  } catch {
+    return null;
+  }
+}
+
+function buildModelRouteCandidate(ctx: AdapterExecutionContext): ModelRouteCandidate {
+  const config = ctx.config ?? {};
+  const env = readRecordConfigValue(config, "env");
+  const issueId = readStringConfigValue(ctx.context ?? {}, "issueId");
+  const provider = readStringConfigValue(config, "provider");
+  const model = readStringConfigValue(config, "model");
+  const baseUrl =
+    readStringConfigValue(config, "baseUrl")
+    ?? readStringConfigValue(config, "base_url")
+    ?? readStringConfigValue(config, "OPENAI_BASE_URL");
+  const usageCategory =
+    (readStringConfigValue(config, "modelRouteUsageCategory")
+      ?? readStringConfigValue(config, "usageCategory")
+      ?? "primary") as ModelRouteUsageCategory;
+
+  return {
+    companyId: ctx.agent.companyId,
+    actorKind: "agent",
+    actorId: ctx.agent.id,
+    scopeKind: issueId ? "issue" : "agent",
+    scopeId: issueId ?? ctx.agent.id,
+    provider,
+    model,
+    baseUrl,
+    envKeysPresent: env ? Object.keys(env) : [],
+    adapterType: ctx.agent.adapterType,
+    adapterConfigPath: "agent.adapterConfig",
+    runId: ctx.runId,
+    usageCategory,
+    requestedModelProfile: readStringConfigValue(config, "modelProfile"),
+    approvalId: readStringConfigValue(config, "modelRouteApprovalId"),
+  };
+}
+
+const modelRoutePolicyWrappedAdapters = new WeakSet<ServerAdapterModule>();
+
+function withModelRoutePolicy(adapter: ServerAdapterModule): ServerAdapterModule {
+  if (modelRoutePolicyWrappedAdapters.has(adapter)) return adapter;
+  modelRoutePolicyWrappedAdapters.add(adapter);
+  const originalExecute = adapter.execute;
+  adapter.execute = async (ctx) => {
+    const candidate = buildModelRouteCandidate(ctx);
+    const approval = await resolveAuthoritativeModelRouteApproval(candidate);
+    const decision = evaluateModelRoutePolicy(candidate, { approval });
+    if (!decision.allowed) {
+      await ctx.onMeta?.({
+        adapterType: adapter.type,
+        command: "model-route-policy:denied",
+        context: {
+          modelRoutePolicy: {
+            event: "denied",
+            allowed: false,
+            violationCode: decision.violationCode,
+            reason: decision.reason,
+            redactedSignals: decision.redactedSignals ?? [],
+            runId: ctx.runId,
+            candidate,
+          },
+        },
+      });
+      throw new Error(decision.reason);
+    }
+
+    if (decision.normalizedProvider === "openrouter") {
+      await ctx.onMeta?.({
+        adapterType: adapter.type,
+        command: "model-route-policy:approved",
+        context: {
+          modelRoutePolicy: {
+            event: "approved",
+            allowed: true,
+            approvalId: decision.approvalId ?? null,
+            approvalSource: "authoritative_resolver",
+            normalizedProvider: decision.normalizedProvider,
+            normalizedModel: decision.normalizedModel,
+            runId: ctx.runId,
+            candidate,
+          },
+        },
+      });
+    }
+
+    return originalExecute(ctx);
+  };
+  return adapter;
+}
+
+function readHermesEnvRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function resolvedHermesRuntimeEnv(input: {
+  agentEnv: unknown;
+  runtimeEnv: unknown;
+}): Record<string, string> {
+  const runtimeEnv = readHermesEnvRecord(input.runtimeEnv);
+  const agentEnv = readHermesEnvRecord(input.agentEnv);
+  const resolved: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(runtimeEnv)) {
+    if (typeof value !== "string") {
+      throw new Error(`Unresolved Hermes runtime environment binding for ${key}`);
+    }
+    resolved[key] = value;
+  }
+
+  for (const [key, value] of Object.entries(agentEnv)) {
+    if (typeof value === "string") {
+      if (!Object.prototype.hasOwnProperty.call(resolved, key)) {
+        resolved[key] = value;
+      }
+      continue;
+    }
+    if (!Object.prototype.hasOwnProperty.call(resolved, key)) {
+      throw new Error(`Unresolved Hermes runtime environment binding for ${key}`);
+    }
+  }
+
+  return resolved;
+}
+
+function withHermesLocalRuntimeAuth(adapter: ServerAdapterModule): ServerAdapterModule {
+  if (adapter.type !== "hermes_local") return adapter;
+  const originalExecute = adapter.execute;
+  return {
+    ...adapter,
+    execute: async (ctx) => {
+      const normalizedCtx = normalizeHermesConfig(ctx);
+      if (!normalizedCtx.authToken) return originalExecute(normalizedCtx);
+
+      const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
+      const runtimeConfig = (normalizedCtx.config ?? {}) as Record<string, unknown>;
+      const existingEnv = resolvedHermesRuntimeEnv({
+        agentEnv: existingConfig.env,
+        runtimeEnv: runtimeConfig.env,
+      });
+      const explicitApiKey =
+        typeof existingEnv.PAPERCLIP_API_KEY === "string" && existingEnv.PAPERCLIP_API_KEY.trim().length > 0;
+      const promptTemplate =
+        typeof existingConfig.promptTemplate === "string" && existingConfig.promptTemplate.trim().length > 0
+          ? existingConfig.promptTemplate
+          : "";
+      const authGuardPrompt = [
+        "Paperclip API safety rule:",
+        "Use Authorization: Bearer $PAPERCLIP_API_KEY on every Paperclip API request.",
+        "Use X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID on every Paperclip API request that writes or mutates data, including comments and issue updates.",
+        "Never use a board, browser, or local-board session for Paperclip API writes.",
+      ].join("\n");
+      const patchedEnv = {
         ...existingEnv,
         ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
         PAPERCLIP_RUN_ID: normalizedCtx.runId,
-      },
-    };
+      };
 
-    // Only inject the auth guard into promptTemplate when a custom template already exists.
-    // When no custom template is set, Hermes uses its built-in default heartbeat/task prompt —
-    // overwriting it with only the auth guard text would strip the assigned issue/workflow instructions.
-    if (promptTemplate) {
-      patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
-    }
+      const patchedConfig: Record<string, unknown> = {
+        ...existingConfig,
+        env: patchedEnv,
+      };
+      const patchedRuntimeConfig: Record<string, unknown> = {
+        ...runtimeConfig,
+        env: patchedEnv,
+      };
 
-    const patchedCtx = {
-      ...normalizedCtx,
-      agent: {
-        ...normalizedCtx.agent,
-        adapterConfig: patchedConfig,
-      },
-    };
+      // Only inject the auth guard into promptTemplate when a custom template already exists.
+      // When no custom template is set, Hermes uses its built-in default heartbeat/task prompt —
+      // overwriting it with only the auth guard text would strip the assigned issue/workflow instructions.
+      if (promptTemplate) {
+        patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
+      }
 
-    return executeHermesLocal(patchedCtx);
-  },
+      const patchedCtx = {
+        ...normalizedCtx,
+        config: patchedRuntimeConfig,
+        agent: {
+          ...normalizedCtx.agent,
+          adapterConfig: patchedConfig,
+        },
+      };
+
+      return originalExecute(patchedCtx);
+    },
+  };
+}
+
+const hermesLocalAdapter: ServerAdapterModule = withHermesLocalRuntimeAuth({
+  type: "hermes_local",
+  execute: executeHermesLocal,
   testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
   sessionCodec: hermesSessionCodec,
   listSkills: hermesListSkills,
@@ -497,7 +676,7 @@ const hermesLocalAdapter: ServerAdapterModule = {
   requiresMaterializedRuntimeSkills: false,
   agentConfigurationDoc: hermesAgentConfigurationDoc,
   detectModel: () => detectModelFromHermes(),
-};
+});
 
 const adaptersByType = new Map<string, ServerAdapterModule>();
 
@@ -526,7 +705,7 @@ function registerBuiltInAdapters() {
     processAdapter,
     httpAdapter,
   ]) {
-    adaptersByType.set(adapter.type, adapter);
+    adaptersByType.set(adapter.type, withModelRoutePolicy(adapter));
   }
 }
 
@@ -566,13 +745,13 @@ function getDisabledAdapterTypesFromStore(): string[] {
 export function resolveExternalAdapterRegistration(
   externalAdapter: ServerAdapterModule,
 ): ServerAdapterModule {
-  return {
+  return withModelRoutePolicy(withHermesLocalRuntimeAuth({
     ...externalAdapter,
     sessionManagement:
       externalAdapter.sessionManagement
         ?? getAdapterSessionManagement(externalAdapter.type)
         ?? undefined,
-  };
+  }));
 }
 
 /**
@@ -623,7 +802,7 @@ export function registerServerAdapter(adapter: ServerAdapterModule): void {
       builtinFallbacks.set(adapter.type, existing);
     }
   }
-  adaptersByType.set(adapter.type, adapter);
+  adaptersByType.set(adapter.type, withModelRoutePolicy(withHermesLocalRuntimeAuth(adapter)));
 }
 
 export function unregisterServerAdapter(type: string): void {

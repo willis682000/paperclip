@@ -9,6 +9,15 @@ export const STATUS_ONLY_RECOVERY_GUARD_CONTEXT = {
   resumeRequiresNormalModel: true,
 } as const;
 
+export function isStatusOnlyRecoveryGuardContext(
+  input: Record<string, unknown> | null | undefined,
+): boolean {
+  return input?.recoveryIntent === STATUS_ONLY_RECOVERY_GUARD_CONTEXT.recoveryIntent
+    && input.allowDeliverableWork === STATUS_ONLY_RECOVERY_GUARD_CONTEXT.allowDeliverableWork
+    && input.allowDocumentUpdates === STATUS_ONLY_RECOVERY_GUARD_CONTEXT.allowDocumentUpdates
+    && input.resumeRequiresNormalModel === STATUS_ONLY_RECOVERY_GUARD_CONTEXT.resumeRequiresNormalModel;
+}
+
 const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
   "modelProfile",
   "paperclipModelProfile",

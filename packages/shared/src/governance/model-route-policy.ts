@@ -29,6 +29,7 @@ export interface ModelRouteCandidate {
   envKeysPresent?: string[];
   adapterType?: string | null;
   adapterConfigPath?: string | null;
+  runId?: string | null;
   usageCategory?: ModelRouteUsageCategory | null;
   requestedModelProfile?: string | null;
   approvalId?: string | null;
